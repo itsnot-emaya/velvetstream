@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main, agent/velvetstream-mvp]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --ignore-scripts
+      - run: node --check server.js
+      - run: node --check app.js
+      - run: node --check scripts/init-db.js
+      - run: node --check scripts/create-admin.js
