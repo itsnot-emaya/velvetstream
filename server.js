@@ -8,7 +8,7 @@ import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const { Pool } = pg;
@@ -19,9 +19,8 @@ const JWT_SECRET = process.env.JWT_SECRET || '';
 const MAX_VIDEO_BYTES = Number(process.env.MAX_VIDEO_BYTES || 536870912);
 const ALLOWED_VIDEO_TYPES = new Set(['video/mp4','video/webm','video/quicktime']);
 
-if (process.env.NODE_ENV === 'production' && JWT_SECRET.length < 32) {
-  throw new Error('JWT_SECRET must be at least 32 characters in production.');
-}
+if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required.');
+if (JWT_SECRET.length < 32) throw new Error('JWT_SECRET must be at least 32 characters.');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -57,11 +56,7 @@ function auth(required = true) {
     catch { return required ? res.status(401).json({ error: 'Invalid or expired session.' }) : next(); }
   };
 }
-
-function adminOnly(req, res, next) {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
-  next();
-}
+function adminOnly(req, res, next) { if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required.' }); next(); }
 
 app.get('/api/health', async (_req, res) => {
   try { await pool.query('select 1'); res.json({ ok: true, database: true, storage: storageConfigured }); }
@@ -107,19 +102,36 @@ app.post('/api/uploads/presign', auth(), async (req, res) => {
   if (!Number.isFinite(size) || size <= 0 || size > MAX_VIDEO_BYTES) return res.status(400).json({ error: `Video must be smaller than ${Math.round(MAX_VIDEO_BYTES / 1024 / 1024)} MB.` });
   const ext = contentType === 'video/mp4' ? 'mp4' : contentType === 'video/webm' ? 'webm' : 'mov';
   const objectKey = `pending/${req.user.sub}/${crypto.randomUUID()}.${ext}`;
-  const command = new PutObjectCommand({ Bucket: process.env.S3_BUCKET, Key: objectKey, ContentType: contentType, ContentLength: size });
+  const command = new PutObjectCommand({ Bucket: process.env.S3_BUCKET, Key: objectKey, ContentType: contentType });
   const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 900 });
   res.json({ uploadUrl, objectKey, expiresIn: 900 });
 });
 
 app.post('/api/submissions', auth(), async (req, res) => {
+  if (!storageConfigured) return res.status(503).json({ error: 'Object storage is not configured.' });
   const title = clean(req.body.title, 80), category = clean(req.body.category, 40), description = clean(req.body.description, 1000), objectKey = clean(req.body.objectKey, 500);
   if (!title || !category || !objectKey) return res.status(400).json({ error: 'Title, category and uploaded object are required.' });
   if (!objectKey.startsWith(`pending/${req.user.sub}/`)) return res.status(400).json({ error: 'Invalid upload reference.' });
   if (!(req.body.adultVerified && req.body.consentConfirmed && req.body.rightsConfirmed)) return res.status(400).json({ error: 'All age, consent and rights confirmations are required.' });
-  const { rows } = await pool.query(`insert into submissions(user_id,title,category,description,object_key,adult_verified,consent_confirmed,rights_confirmed)
-    values($1,$2,$3,$4,$5,true,true,true) returning id,title,category,status,created_at`, [req.user.sub,title,category,description,objectKey]);
-  res.status(201).json({ submission: rows[0] });
+  try {
+    const head = await s3.send(new HeadObjectCommand({ Bucket: process.env.S3_BUCKET, Key: objectKey }));
+    const type = String(head.ContentType || '').toLowerCase();
+    const size = Number(head.ContentLength || 0);
+    if (!ALLOWED_VIDEO_TYPES.has(type) || !size || size > MAX_VIDEO_BYTES) {
+      await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: objectKey }));
+      return res.status(400).json({ error: 'Uploaded object failed file validation.' });
+    }
+  } catch (e) {
+    console.error('Upload verification failed', e);
+    return res.status(400).json({ error: 'Uploaded object could not be verified.' });
+  }
+  try {
+    const { rows } = await pool.query(`insert into submissions(user_id,title,category,description,object_key,adult_verified,consent_confirmed,rights_confirmed)
+      values($1,$2,$3,$4,$5,true,true,true) returning id,title,category,status,created_at`, [req.user.sub,title,category,description,objectKey]);
+    res.status(201).json({ submission: rows[0] });
+  } catch (e) {
+    console.error(e); res.status(500).json({ error: 'Could not create submission.' });
+  }
 });
 
 app.get('/api/my/submissions', auth(), async (req, res) => {
@@ -178,6 +190,6 @@ app.get('/api/admin/reports', auth(), adminOnly, async (_req, res) => {
 });
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found.' }));
-app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.use((req, res, next) => { if (req.method === 'GET') return res.sendFile(path.join(__dirname, 'index.html')); next(); });
 
 app.listen(PORT, () => console.log(`VelvetStream listening on http://localhost:${PORT}`));
